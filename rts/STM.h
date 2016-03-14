@@ -152,12 +152,26 @@ void stmAddInvariantToCheck(Capability *cap,
 
 /*
  * Test whether the current transaction context is valid and, if so,
+ * and has_finalizer is TRUE, marks the involved TVars.
+ *
+ * If the return value is TRUE, it is safe to call stmCommitTransaction.
+ * If the return value is FALSE, check the status of the TRec:
+ *   - if it is TREC_WAITING_FOR_FINALIZER, the thread will be waiting
+ *   - otherwise, there was a conflict and you need to restart the transaction
+ */
+
+StgBool stmPrepareToCommitTransaction(Capability *cap,
+                                      StgTSO *tso,
+                                      StgTRecHeader *trec,
+                                      StgBool has_finalizer);
+
+/*
+ * After a transaction has been prepared for commit, calling this will
  * commit its memory accesses to the heap.  stmCommitTransaction must
  * unblock any threads which are waiting on tvars that updates have
  * been committed to.
  */
-
-StgBool stmCommitTransaction(Capability *cap, StgTRecHeader *trec);
+void stmCommitTransaction(Capability *cap, StgTRecHeader *trec);
 StgBool stmCommitNestedTransaction(Capability *cap, StgTRecHeader *trec);
 
 /*
@@ -214,6 +228,15 @@ void stmWriteTVar(Capability *cap,
 #define END_STM_CHUNK_LIST ((StgTRecChunk *)(void *)&stg_END_STM_CHUNK_LIST_closure)
 
 #define NO_TREC ((StgTRecHeader *)(void *)&stg_NO_TREC_closure)
+
+/*----------------------------------------------------------------------*/
+
+// The boundary TRec of a transaction is the enclosing_trec of the outermost
+// TRec in a nest of TRecs (nesting due to orElse/invariants).
+// Usually this is NO_TREC, but if the transaction was started inside the
+// finalizer of another transaction, it is that other transaction's TRec.
+// Basically, it's the outer TRec of any TRec started by atomically.
+#define TRecIsBoundary(t) ((t) == NO_TREC || (t)->state == TREC_FINALIZING)
 
 /*----------------------------------------------------------------------*/
 

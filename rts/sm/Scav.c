@@ -459,6 +459,7 @@ scavenge_block (bdescr *bd)
         StgTVar *tvar = ((StgTVar *)p);
         gct->eager_promotion = rtsFalse;
         evacuate((StgClosure **)&tvar->current_value);
+        evacuate((StgClosure **)&tvar->frozen_by);
         evacuate((StgClosure **)&tvar->first_watch_queue_entry);
         gct->eager_promotion = saved_eager_promotion;
 
@@ -882,6 +883,7 @@ scavenge_mark_stack(void)
             StgTVar *tvar = ((StgTVar *)p);
             gct->eager_promotion = rtsFalse;
             evacuate((StgClosure **)&tvar->current_value);
+            evacuate((StgClosure **)&tvar->frozen_by);
             evacuate((StgClosure **)&tvar->first_watch_queue_entry);
             gct->eager_promotion = saved_eager_promotion;
 
@@ -1247,6 +1249,7 @@ scavenge_one(StgPtr p)
         StgTVar *tvar = ((StgTVar *)p);
         gct->eager_promotion = rtsFalse;
         evacuate((StgClosure **)&tvar->current_value);
+        evacuate((StgClosure **)&tvar->frozen_by);
         evacuate((StgClosure **)&tvar->first_watch_queue_entry);
         gct->eager_promotion = saved_eager_promotion;
 

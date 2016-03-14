@@ -417,7 +417,7 @@ INFO_TABLE_CONSTR(stg_C_FINALIZER_LIST,1,4,0,CONSTR,"C_FINALIZER_LIST","C_FINALI
    NO_FINALIZER
 
    This is a static nullary constructor (like []) that we use to mark an empty
-   finalizer in a weak pointer object.
+   finalizer in a weak pointer object or an STM transaction.
    ------------------------------------------------------------------------- */
 
 INFO_TABLE_CONSTR(stg_NO_FINALIZER,0,0,0,CONSTR_NOCAF_STATIC,"NO_FINALIZER","NO_FINALIZER")
@@ -449,10 +449,10 @@ INFO_TABLE(stg_MVAR_DIRTY,3,0,MVAR_DIRTY,"MVAR","MVAR")
    STM
    -------------------------------------------------------------------------- */
 
-INFO_TABLE(stg_TVAR_CLEAN, 2, 1, TVAR, "TVAR", "TVAR")
+INFO_TABLE(stg_TVAR_CLEAN, 3, 1, TVAR, "TVAR", "TVAR")
 { foreign "C" barf("TVAR_CLEAN object entered!") never returns; }
 
-INFO_TABLE(stg_TVAR_DIRTY, 2, 1, TVAR, "TVAR", "TVAR")
+INFO_TABLE(stg_TVAR_DIRTY, 3, 1, TVAR, "TVAR", "TVAR")
 { foreign "C" barf("TVAR_DIRTY object entered!") never returns; }
 
 INFO_TABLE(stg_TVAR_WATCH_QUEUE, 3, 0, MUT_PRIM, "TVAR_WATCH_QUEUE", "TVAR_WATCH_QUEUE")

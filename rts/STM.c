@@ -275,7 +275,7 @@ static StgBool cond_lock_tvar(StgTRecHeader *trec STG_UNUSED,
   TRACE("%p : cond_lock_tvar(%p, %p)", trec, s, expected);
   ASSERT(smp_locked == trec);
   result = s -> current_value;
-  TRACE("%p : %d", result ? "success" : "failure");
+  TRACE("%p : %d", (result == expected) ? "success" : "failure");
   return (result == expected);
 }
 
@@ -335,7 +335,7 @@ static StgBool cond_lock_tvar(StgTRecHeader *trec,
   TRACE("%p : cond_lock_tvar(%p, %p)", trec, s, expected);
   w = cas((void *)&(s -> current_value), (StgWord)expected, (StgWord)trec);
   result = (StgClosure *)w;
-  TRACE("%p : %s", trec, result ? "success" : "failure");
+  TRACE("%p : %s", trec, (result == expected) ? "success" : "failure");
   return (result == expected);
 }
 
@@ -460,7 +460,7 @@ static StgTRecHeader *new_stg_trec_header(Capability *cap,
   result -> current_chunk = new_stg_trec_chunk(cap);
   result -> invariants_to_check = END_INVARIANT_CHECK_QUEUE;
 
-  if (enclosing_trec == NO_TREC) {
+  if (TRecIsBoundary(enclosing_trec)) {
     result -> state = TREC_ACTIVE;
   } else {
     ASSERT(enclosing_trec -> state == TREC_ACTIVE ||
@@ -543,7 +543,7 @@ static StgTRecHeader *alloc_stg_trec_header(Capability *cap,
     result -> enclosing_trec = enclosing_trec;
     result -> current_chunk -> next_entry_idx = 0;
     result -> invariants_to_check = END_INVARIANT_CHECK_QUEUE;
-    if (enclosing_trec == NO_TREC) {
+    if (TRecIsBoundary(enclosing_trec)) {
       result -> state = TREC_ACTIVE;
     } else {
       ASSERT(enclosing_trec -> state == TREC_ACTIVE ||
@@ -577,7 +577,7 @@ static void build_watch_queue_entries_for_trec(Capability *cap,
                                                StgTSO *tso,
                                                StgTRecHeader *trec) {
   ASSERT(trec != NO_TREC);
-  ASSERT(trec -> enclosing_trec == NO_TREC);
+  ASSERT(TRecIsBoundary(trec -> enclosing_trec));
   ASSERT(trec -> state == TREC_ACTIVE);
 
   TRACE("%p : build_watch_queue_entries_for_trec()", trec);
@@ -606,8 +606,9 @@ static void build_watch_queue_entries_for_trec(Capability *cap,
 static void remove_watch_queue_entries_for_trec(Capability *cap,
                                                 StgTRecHeader *trec) {
   ASSERT(trec != NO_TREC);
-  ASSERT(trec -> enclosing_trec == NO_TREC);
+  ASSERT(TRecIsBoundary(trec -> enclosing_trec));
   ASSERT(trec -> state == TREC_WAITING ||
+         trec -> state == TREC_WAITING_FOR_FINALIZER ||
          trec -> state == TREC_CONDEMNED);
 
   TRACE("%p : remove_watch_queue_entries_for_trec()", trec);
@@ -742,7 +743,7 @@ static void merge_read_into(Capability *cap,
   // write e->new_value over the outer entry, because the inner entry
   // is the most up to date.
   //
-  for (t = trec; !found && t != NO_TREC; t = t -> enclosing_trec)
+  for (t = trec; !found && !TRecIsBoundary(t); t = t -> enclosing_trec)
   {
     FOR_EACH_ENTRY(t, e, {
       if (e -> tvar == tvar) {
@@ -797,21 +798,54 @@ static StgBool tvar_is_locked(StgTVar *s, StgTRecHeader *h) {
 // is set in stmWait and stmReWait when we acquired locks on all of
 // the TVars involved.  "revert_all" is not set in commit operations
 // where we don't lock TVars that have been read from but not updated.
+// This also unfreezes any TVars frozen by the TRec.
 
 static void revert_ownership(Capability *cap STG_UNUSED,
-                             StgTRecHeader *trec STG_UNUSED,
-                             StgBool revert_all STG_UNUSED) {
+                             StgTRecHeader *trec,
+                             StgBool revert_all STG_UNUSED,
+                             StgBool unfreeze) {
 #if defined(STM_FG_LOCKS)
+  ASSERT(!(unfreeze && !revert_all));
   FOR_EACH_ENTRY(trec, e, {
     if (revert_all || entry_is_update(e)) {
       StgTVar *s;
       s = e -> tvar;
       if (tvar_is_locked(s, trec)) {
+          if (unfreeze && s -> frozen_by == trec) {
+            s -> frozen_by = NO_TREC;
+            dirty_TVAR(cap,s);
+          }
           unlock_tvar(cap, trec, s, e -> expected_value, TRUE);
       }
     }
   });
+#else
+  if (unfreeze) {
+    FOR_EACH_ENTRY(trec, e, {
+      StgTVar *s;
+      s = e -> tvar;
+      if (s -> frozen_by == trec) {
+        s -> frozen_by = NO_TREC;
+        dirty_TVAR(cap,s);
+      }
+    });
+  }
 #endif
+}
+
+
+// This unfreezes all TVars frozen by the TRec (but not by other TRecs).
+// The TVars must already be locked & will remain locked.
+static void revert_freeze(Capability *cap, StgTRecHeader *trec) {
+  FOR_EACH_ENTRY(trec, e, {
+    StgTVar *s;
+    s = e -> tvar;
+    ACQ_ASSERT(tvar_is_locked(s, trec));
+    if (s -> frozen_by == trec) {
+      s -> frozen_by = NO_TREC;
+      dirty_TVAR(cap,s);
+    }
+  });
 }
 
 /*......................................................................*/
@@ -829,22 +863,37 @@ static void revert_ownership(Capability *cap STG_UNUSED,
 //     to ensure that an atomic snapshot of all of these locations has been
 //     seen.
 
-static StgBool validate_and_acquire_ownership (Capability *cap,
-                                               StgTRecHeader *trec,
-                                               int acquire_all,
-                                               int retain_ownership) {
-  StgBool result;
+#define STM_VALID      0
+#define STM_FROSTBITE  1  // retains ownership!!!
+#define STM_INVALID    2
+
+static int validate_and_acquire_ownership (Capability *cap,
+                                           StgTRecHeader *trec,
+                                           int acquire_all,
+                                           int retain_ownership,
+                                           int check_frozen,
+                                           int freeze) {
+  int result;
 
   if (shake()) {
     TRACE("%p : shake, pretending trec is invalid when it may not be", trec);
     return FALSE;
   }
 
+  ASSERT(!(freeze && !acquire_all));
+  ASSERT(!(freeze && !check_frozen));
   ASSERT((trec -> state == TREC_ACTIVE) ||
          (trec -> state == TREC_WAITING) ||
+         (trec -> state == TREC_WAITING_FOR_FINALIZER) ||
          (trec -> state == TREC_CONDEMNED));
-  result = !((trec -> state) == TREC_CONDEMNED);
-  if (result) {
+
+  if (trec -> state == TREC_CONDEMNED) {
+    result = STM_INVALID;
+  } else {
+    result = STM_VALID;
+  }
+
+  if (result == STM_VALID) {
     FOR_EACH_ENTRY(trec, e, {
       StgTVar *s;
       s = e -> tvar;
@@ -852,7 +901,7 @@ static StgBool validate_and_acquire_ownership (Capability *cap,
         TRACE("%p : trying to acquire %p", trec, s);
         if (!cond_lock_tvar(trec, s, e -> expected_value)) {
           TRACE("%p : failed to acquire %p", trec, s);
-          result = FALSE;
+          result = STM_INVALID;
           BREAK_FOR_EACH;
         }
       } else {
@@ -861,24 +910,40 @@ static StgBool validate_and_acquire_ownership (Capability *cap,
           TRACE("%p : will need to check %p", trec, s);
           if (s -> current_value != e -> expected_value) {
             TRACE("%p : doesn't match", trec);
-            result = FALSE;
+            result = STM_INVALID;
             BREAK_FOR_EACH;
           }
           e -> num_updates = s -> num_updates;
           if (s -> current_value != e -> expected_value) {
             TRACE("%p : doesn't match (race)", trec);
-            result = FALSE;
+            result = STM_INVALID;
             BREAK_FOR_EACH;
           } else {
             TRACE("%p : need to check version %ld", trec, e -> num_updates);
           }
         });
       }
+
+      if (check_frozen && (freeze || entry_is_update(e))) {
+        if (s -> frozen_by != NO_TREC) {
+          TRACE("%p : %p is frozen by %p", trec, s, s -> frozen_by);
+          result = STM_FROSTBITE;
+          // don't break yet, another TVar could be invalid, which trumps this
+        }
+      }
+      if (freeze && result == STM_VALID) {
+        TRACE("%p : freezing %p", trec, s);
+        ASSERT(s -> frozen_by == NO_TREC);
+        s -> frozen_by = trec;
+        dirty_TVAR(cap,s);
+      }
     });
   }
 
-  if ((!result) || (!retain_ownership)) {
-      revert_ownership(cap, trec, acquire_all);
+  if ((result == STM_INVALID) || (!retain_ownership)) {
+      revert_ownership(cap, trec, acquire_all, freeze);
+  } else if ((result == STM_FROSTBITE) && (freeze)) {
+      revert_freeze(cap, trec);
   }
 
   return result;
@@ -989,29 +1054,46 @@ StgTRecHeader *stmStartTransaction(Capability *cap,
 
 /*......................................................................*/
 
+static void unfreeze_all(Capability *cap, StgTRecHeader *trec) {
+  FOR_EACH_ENTRY(trec, e, {
+    StgTVar *s;
+    StgClosure *saw;
+    s = e -> tvar;
+    saw = lock_tvar(trec, s);
+    ASSERT(s -> frozen_by == trec);
+    s -> frozen_by = NO_TREC;
+    dirty_TVAR(cap,s);
+    unlock_tvar(cap, trec, s, saw, FALSE);
+  });
+}
+
 void stmAbortTransaction(Capability *cap,
                          StgTRecHeader *trec) {
   StgTRecHeader *et;
   TRACE("%p : stmAbortTransaction", trec);
   ASSERT(trec != NO_TREC);
   ASSERT((trec -> state == TREC_ACTIVE) ||
+         (trec -> state == TREC_FINALIZING) ||
          (trec -> state == TREC_WAITING) ||
+         (trec -> state == TREC_WAITING_FOR_FINALIZER) ||
          (trec -> state == TREC_CONDEMNED));
 
   lock_stm(trec);
 
   et = trec -> enclosing_trec;
-  if (et == NO_TREC) {
+  if (TRecIsBoundary(et)) {
     // We're a top-level transaction: remove any watch queue entries that
     // we may have.
     TRACE("%p : aborting top-level transaction", trec);
 
-    if (trec -> state == TREC_WAITING) {
-      ASSERT(trec -> enclosing_trec == NO_TREC);
+    if (trec -> state == TREC_WAITING ||
+        trec -> state == TREC_WAITING_FOR_FINALIZER) {
+      ASSERT(TRecIsBoundary(trec -> enclosing_trec));
       TRACE("%p : stmAbortTransaction aborting waiting transaction", trec);
       remove_watch_queue_entries_for_trec(cap, trec);
+    } else if (trec -> state == TREC_FINALIZING) {
+      unfreeze_all(cap, trec);
     }
-
   } else {
     // We're a nested transaction: merge our read set into our parent's
     TRACE("%p : retaining read-set into parent %p", trec, et);
@@ -1050,11 +1132,12 @@ void stmCondemnTransaction(Capability *cap,
   ASSERT(trec != NO_TREC);
   ASSERT((trec -> state == TREC_ACTIVE) ||
          (trec -> state == TREC_WAITING) ||
+         (trec -> state == TREC_WAITING_FOR_FINALIZER) ||
          (trec -> state == TREC_CONDEMNED));
 
   lock_stm(trec);
   if (trec -> state == TREC_WAITING) {
-    ASSERT(trec -> enclosing_trec == NO_TREC);
+    ASSERT(TRecIsBoundary(trec -> enclosing_trec));
     TRACE("%p : stmCondemnTransaction condemning waiting transaction", trec);
     remove_watch_queue_entries_for_trec(cap, trec);
   }
@@ -1073,15 +1156,18 @@ StgBool stmValidateNestOfTransactions(Capability *cap, StgTRecHeader *trec) {
   TRACE("%p : stmValidateNestOfTransactions", trec);
   ASSERT(trec != NO_TREC);
   ASSERT((trec -> state == TREC_ACTIVE) ||
+         (trec -> state == TREC_FINALIZING) ||
          (trec -> state == TREC_WAITING) ||
+         (trec -> state == TREC_WAITING_FOR_FINALIZER) ||
          (trec -> state == TREC_CONDEMNED));
 
   lock_stm(trec);
 
   t = trec;
   result = TRUE;
-  while (t != NO_TREC) {
-    result &= validate_and_acquire_ownership(cap, t, TRUE, FALSE);
+  while (!TRecIsBoundary(t)) {
+    result &= (STM_VALID == validate_and_acquire_ownership(
+                                cap, t, TRUE, FALSE, TRUE, FALSE));
     t = t -> enclosing_trec;
   }
 
@@ -1114,7 +1200,7 @@ static TRecEntry *get_entry_for(StgTRecHeader *trec, StgTVar *tvar, StgTRecHeade
       }
     });
     trec = trec -> enclosing_trec;
-  } while (result == NULL && trec != NO_TREC);
+  } while (result == NULL && !TRecIsBoundary(trec));
 
   return result;
 }
@@ -1251,7 +1337,7 @@ StgInvariantCheckQueue *stmGetInvariantsToCheck(Capability *cap, StgTRecHeader *
   ASSERT((trec -> state == TREC_ACTIVE) ||
          (trec -> state == TREC_WAITING) ||
          (trec -> state == TREC_CONDEMNED));
-  ASSERT(trec -> enclosing_trec == NO_TREC);
+  ASSERT(TRecIsBoundary(trec -> enclosing_trec));
 
   lock_stm(trec);
   c = trec -> current_chunk;
@@ -1313,18 +1399,21 @@ StgInvariantCheckQueue *stmGetInvariantsToCheck(Capability *cap, StgTRecHeader *
 
 /*......................................................................*/
 
-StgBool stmCommitTransaction(Capability *cap, StgTRecHeader *trec) {
+StgBool stmPrepareToCommitTransaction(Capability *cap, StgTSO *tso,
+                                      StgTRecHeader *trec,
+                                      StgBool has_finalizer) {
   int result;
   StgInt64 max_commits_at_start = max_commits;
   StgBool touched_invariants;
   StgBool use_read_phase;
 
-  TRACE("%p : stmCommitTransaction()", trec);
+  TRACE("%p : stmPrepareToCommitTransaction(%p)", trec, tso);
   ASSERT(trec != NO_TREC);
+  ASSERT(tso -> trec == trec);
 
   lock_stm(trec);
 
-  ASSERT(trec -> enclosing_trec == NO_TREC);
+  ASSERT(TRecIsBoundary(trec -> enclosing_trec));
   ASSERT((trec -> state == TREC_ACTIVE) ||
          (trec -> state == TREC_CONDEMNED));
 
@@ -1376,17 +1465,23 @@ StgBool stmCommitTransaction(Capability *cap, StgTRecHeader *trec) {
 
   // Use a read-phase (i.e. don't lock TVars we've read but not updated) if
   // (i) the configuration lets us use a read phase, and (ii) we've not
-  // touched or introduced any invariants.
+  // touched or introduced any invariants, and (iii) we are not doing
+  // commit-time I/O.
   //
   // In principle we could extend the implementation to support a read-phase
   // and invariants, but it complicates the logic: the links between
   // invariants and TVars are managed by the TVar watch queues which are
   // protected by the TVar's locks.
+  //
+  // The same is true for finalizers: the finalizing_trec field on the TVar is
+  // also protected by the TVar lock.
 
-  use_read_phase = ((config_use_read_phase) && (!touched_invariants));
+  use_read_phase = ((config_use_read_phase) && (!touched_invariants) &&
+                   (!has_finalizer));
 
-  result = validate_and_acquire_ownership(cap, trec, (!use_read_phase), TRUE);
-  if (result) {
+  result = validate_and_acquire_ownership(
+              cap, trec, (!use_read_phase), TRUE, TRUE, has_finalizer);
+  if (result == STM_VALID) {
     // We now know that all the updated locations hold their expected values.
     ASSERT(trec -> state == TREC_ACTIVE);
 
@@ -1396,71 +1491,130 @@ StgBool stmCommitTransaction(Capability *cap, StgTRecHeader *trec) {
       TRACE("%p : doing read check", trec);
       result = check_read_only(trec);
       TRACE("%p : read-check %s", trec, result ? "succeeded" : "failed");
+      result = result ? STM_VALID : STM_INVALID;
 
       max_commits_at_end = max_commits;
       max_concurrent_commits = ((max_commits_at_end - max_commits_at_start) +
                                 (n_capabilities * TOKEN_BATCH_SIZE));
       if (((max_concurrent_commits >> 32) > 0) || shake()) {
-        result = FALSE;
+        result = STM_INVALID;
       }
     }
 
-    if (result) {
-      // We now know that all of the read-only locations held their exepcted values
-      // at the end of the call to validate_and_acquire_ownership.  This forms the
-      // linearization point of the commit.
+    if (result == STM_VALID) {
+      // We now know that all of the read-only locations held their expected
+      // values at the end of the call to validate_and_acquire_ownership.
+      // This forms the linearization point of the commit.
 
-      // 1. If we have touched or introduced any invariants then unhook them
-      //    from the TVars they depended on last time they were executed
-      //    and hook them on the TVars that they now depend on.
-      if (touched_invariants) {
-        StgInvariantCheckQueue *q = trec -> invariants_to_check;
-        while (q != END_INVARIANT_CHECK_QUEUE) {
-          StgAtomicInvariant *inv = q -> invariant;
-          if (inv -> last_execution != NO_TREC) {
-            disconnect_invariant(cap, inv);
-          }
-
-          TRACE("%p : hooking up new execution trec=%p", trec, q -> my_execution);
-          connect_invariant_to_trec(cap, inv, q -> my_execution);
-
-          TRACE("%p : unlocking invariant %p", trec, inv);
-          unlock_inv(inv);
-
-          q = q -> next_queue_entry;
-        }
+      if (has_finalizer) {
+        // the TVars have been frozen but not updated; run the finalizer next
+        trec -> state = TREC_FINALIZING;
+        revert_ownership(cap, trec, TRUE, FALSE);
+        unlock_stm(trec);
+      } else {
+        // the TVars are still locked; call stmCommit to update them
+        trec -> state = TREC_COMMITTED;
       }
-
-      // 2. Make the updates required by the transaction
-      FOR_EACH_ENTRY(trec, e, {
-        StgTVar *s;
-        s = e -> tvar;
-        if ((!use_read_phase) || (e -> new_value != e -> expected_value)) {
-          // Either the entry is an update or we're not using a read phase:
-          // write the value back to the TVar, unlocking it if necessary.
-
-          ACQ_ASSERT(tvar_is_locked(s, trec));
-          TRACE("%p : writing %p to %p, waking waiters", trec, e -> new_value, s);
-          unpark_waiters_on(cap,s);
-          IF_STM_FG_LOCKS({
-            s -> num_updates ++;
-          });
-          unlock_tvar(cap, trec, s, e -> new_value, TRUE);
-        }
-        ACQ_ASSERT(!tvar_is_locked(s, trec));
-      });
+      result = TRUE;
     } else {
-        revert_ownership(cap, trec, FALSE);
+      // read check has failed; release ownership, unfreeze & abort
+      ASSERT(result == STM_INVALID);
+      revert_ownership(cap, trec, TRUE, has_finalizer);
+      unlock_stm(trec);
+      free_stg_trec_header(cap, trec);
+      result = FALSE;
     }
   }
+
+  else if (result == STM_INVALID) {
+    unlock_stm(trec);
+    free_stg_trec_header(cap, trec);
+    result = FALSE;
+  }
+
+  else if (result == STM_FROSTBITE) {
+    // some TVars are involved in finalizing transactions; we can only wait
+    // (we could call stmWait, but we don't want to validate again)
+    build_watch_queue_entries_for_trec(cap, tso, trec);
+    park_tso(tso);
+    trec -> state = TREC_WAITING_FOR_FINALIZER;
+    result = FALSE;
+  }
+
+  TRACE("%p : stmPrepareToCommitTransaction()=%d", trec, result);
+  return result;
+}
+
+void stmCommitTransaction(Capability *cap, StgTRecHeader *trec) {
+  StgBool touched_invariants;
+  StgBool use_read_phase;
+
+  TRACE("%p : stmCommitTransaction()", trec);
+  ASSERT (trec != NO_TREC);
+  ASSERT(TRecIsBoundary(trec -> enclosing_trec));
+  ASSERT(trec -> state == TREC_FINALIZING ||
+         trec -> state == TREC_COMMITTED);
+
+  if (trec -> state == TREC_FINALIZING) {
+    lock_stm(trec);
+  }
+
+  touched_invariants = (trec->invariants_to_check != END_INVARIANT_CHECK_QUEUE);
+  use_read_phase = ((config_use_read_phase) && (!touched_invariants) &&
+                   (trec -> state != TREC_FINALIZING));
+
+  // 1. If we have touched or introduced any invariants then unhook them
+  //    from the TVars they depended on last time they were executed
+  //    and hook them on the TVars that they now depend on.
+  if (touched_invariants) {
+    StgInvariantCheckQueue *q = trec -> invariants_to_check;
+    while (q != END_INVARIANT_CHECK_QUEUE) {
+      StgAtomicInvariant *inv = q -> invariant;
+        if (inv -> last_execution != NO_TREC) {
+          disconnect_invariant(cap, inv);
+        }
+
+        TRACE("%p : hooking up new execution trec=%p", trec, q -> my_execution);
+        connect_invariant_to_trec(cap, inv, q -> my_execution);
+
+        TRACE("%p : unlocking invariant %p", trec, inv);
+        unlock_inv(inv);
+
+        q = q -> next_queue_entry;
+    }
+  }
+
+  // 2. Make the updates required by the transaction
+  FOR_EACH_ENTRY(trec, e, {
+    StgTVar *s;
+    s = e -> tvar;
+    if ((!use_read_phase) || entry_is_update(e)) {
+      // Either the entry is an update or we're not using a read phase:
+      // write the value back to the TVar, unlocking it if necessary.
+
+      if (trec -> state == TREC_FINALIZING) {
+        lock_tvar(trec, s);
+        TRACE("%p : unfreezing %p", trec, s);
+        ASSERT(s -> frozen_by == trec);
+        s -> frozen_by = NO_TREC;
+        dirty_TVAR(cap,s);
+      }
+      ACQ_ASSERT(tvar_is_locked(s, trec));
+      TRACE("%p : writing %p to %p, waking waiters", trec, e -> new_value, s);
+      unpark_waiters_on(cap,s);
+      IF_STM_FG_LOCKS({
+        s -> num_updates ++;
+      });
+      unlock_tvar(cap, trec, s, e -> new_value, TRUE);
+    }
+    ACQ_ASSERT(!tvar_is_locked(s, trec));
+  });
 
   unlock_stm(trec);
 
   free_stg_trec_header(cap, trec);
 
-  TRACE("%p : stmCommitTransaction()=%d", trec, result);
-
-  return result;
+  TRACE("%p : stmCommitTransaction done", trec);
 }
 
 /*......................................................................*/
@@ -1468,14 +1622,16 @@ StgBool stmCommitTransaction(Capability *cap, StgTRecHeader *trec) {
 StgBool stmCommitNestedTransaction(Capability *cap, StgTRecHeader *trec) {
   StgTRecHeader *et;
   int result;
-  ASSERT(trec != NO_TREC && trec -> enclosing_trec != NO_TREC);
+  ASSERT(trec != NO_TREC && !TRecIsBoundary(trec -> enclosing_trec));
   TRACE("%p : stmCommitNestedTransaction() into %p", trec, trec -> enclosing_trec);
   ASSERT((trec -> state == TREC_ACTIVE) || (trec -> state == TREC_CONDEMNED));
 
   lock_stm(trec);
 
   et = trec -> enclosing_trec;
-  result = validate_and_acquire_ownership(cap, trec, (!config_use_read_phase), TRUE);
+  // note: no need to check for frozen TVars, we're not updating anything yet
+  result = (STM_VALID == validate_and_acquire_ownership(cap, trec,
+                            (!config_use_read_phase), TRUE, FALSE, FALSE));
   if (result) {
     // We now know that all the updated locations hold their expected values.
 
@@ -1502,7 +1658,7 @@ StgBool stmCommitNestedTransaction(Capability *cap, StgTRecHeader *trec) {
         ACQ_ASSERT(s -> current_value != (StgClosure *)trec);
       });
     } else {
-        revert_ownership(cap, trec, FALSE);
+        revert_ownership(cap, trec, FALSE, FALSE);
     }
   }
 
@@ -1519,15 +1675,15 @@ StgBool stmCommitNestedTransaction(Capability *cap, StgTRecHeader *trec) {
 
 StgBool stmWait(Capability *cap, StgTSO *tso, StgTRecHeader *trec) {
   int result;
-  TRACE("%p : stmWait(%p)", trec, tso);
+  TRACE("%p : stmWait(%p,outer=%p)", trec, tso, trec -> enclosing_trec);
   ASSERT(trec != NO_TREC);
-  ASSERT(trec -> enclosing_trec == NO_TREC);
+  ASSERT(TRecIsBoundary(trec -> enclosing_trec));
   ASSERT((trec -> state == TREC_ACTIVE) ||
          (trec -> state == TREC_CONDEMNED));
 
   lock_stm(trec);
-  result = validate_and_acquire_ownership(cap, trec, TRUE, TRUE);
-  if (result) {
+  result = validate_and_acquire_ownership(cap, trec, TRUE, TRUE, TRUE, FALSE);
+  if (result != STM_INVALID) {
     // The transaction is valid so far so we can actually start waiting.
     // (Otherwise the transaction was not valid and the thread will have to
     // retry it).
@@ -1537,7 +1693,12 @@ StgBool stmWait(Capability *cap, StgTSO *tso, StgTRecHeader *trec) {
     // in the TSO, (c) TREC_WAITING in the Trec.
     build_watch_queue_entries_for_trec(cap, tso, trec);
     park_tso(tso);
-    trec -> state = TREC_WAITING;
+    if (result == STM_VALID) {
+        trec -> state = TREC_WAITING;
+    } else {
+        ASSERT (result == STM_FROSTBITE);
+        trec -> state = TREC_WAITING_FOR_FINALIZER;
+    }
 
     // We haven't released ownership of the transaction yet.  The TSO
     // has been put on the wait queue for the TVars it is waiting for,
@@ -1547,9 +1708,12 @@ StgBool stmWait(Capability *cap, StgTSO *tso, StgTRecHeader *trec) {
     // the runtime will call stmWaitUnlock() below, with the same
     // TRec.
 
+    result = TRUE;
+
   } else {
     unlock_stm(trec);
     free_stg_trec_header(cap, trec);
+    result = FALSE;
   }
 
   TRACE("%p : stmWait(%p)=%d", trec, tso, result);
@@ -1559,7 +1723,8 @@ StgBool stmWait(Capability *cap, StgTSO *tso, StgTRecHeader *trec) {
 
 void
 stmWaitUnlock(Capability *cap, StgTRecHeader *trec) {
-    revert_ownership(cap, trec, TRUE);
+    TRACE("%p : stmWaitUnlock", trec);
+    revert_ownership(cap, trec, TRUE, FALSE);
     unlock_stm(trec);
 }
 
@@ -1569,28 +1734,43 @@ StgBool stmReWait(Capability *cap, StgTSO *tso) {
   int result;
   StgTRecHeader *trec = tso->trec;
 
-  TRACE("%p : stmReWait", trec);
+  TRACE("%p : stmReWait(%p)", trec, tso);
   ASSERT(trec != NO_TREC);
-  ASSERT(trec -> enclosing_trec == NO_TREC);
+  ASSERT(TRecIsBoundary(trec -> enclosing_trec));
   ASSERT((trec -> state == TREC_WAITING) ||
+         (trec -> state == TREC_WAITING_FOR_FINALIZER) ||
          (trec -> state == TREC_CONDEMNED));
 
   lock_stm(trec);
-  result = validate_and_acquire_ownership(cap, trec, TRUE, TRUE);
-  TRACE("%p : validation %s", trec, result ? "succeeded" : "failed");
-  if (result) {
-    // The transaction remains valid -- do nothing because it is already on
-    // the wait queues
-    ASSERT(trec -> state == TREC_WAITING);
-    park_tso(tso);
-    revert_ownership(cap, trec, TRUE);
-  } else {
-    // The transcation has become invalid.  We can now remove it from the wait
-    // queues.
-    if (trec -> state != TREC_CONDEMNED) {
-      remove_watch_queue_entries_for_trec (cap, trec);
-    }
-    free_stg_trec_header(cap, trec);
+  result = validate_and_acquire_ownership(cap, trec, TRUE, TRUE, TRUE, FALSE);
+  if (result == STM_VALID) {  // tvars still locked
+        if (trec -> state == TREC_WAITING) {
+                park_tso(tso);
+                revert_ownership(cap, trec, TRUE, FALSE);
+                result = TRUE;
+        } else {
+                ASSERT(trec -> state == TREC_WAITING_FOR_FINALIZER);
+                revert_ownership(cap, trec, TRUE, FALSE);
+                goto wakeup;
+        }
+  }
+
+  else if (result == STM_FROSTBITE) {  // tvars still locked
+        ASSERT(trec -> state != TREC_CONDEMNED);
+        trec -> state = TREC_WAITING_FOR_FINALIZER;
+        park_tso(tso);
+        revert_ownership(cap, trec, TRUE, FALSE);
+        result = TRUE;
+  }
+
+  else if (result == STM_INVALID) {  // locks removed at this point
+wakeup:
+        if (trec -> state != TREC_CONDEMNED) {
+                remove_watch_queue_entries_for_trec(cap, trec);
+        }
+        free_stg_trec_header(cap, trec);
+        result = FALSE;
+
   }
   unlock_stm(trec);
 

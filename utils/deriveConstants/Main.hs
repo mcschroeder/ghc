@@ -481,6 +481,7 @@ wanteds os = concat
 
           ,closureSize  C "StgAtomicallyFrame"
           ,closureField C "StgAtomicallyFrame" "code"
+          ,closureField C "StgAtomicallyFrame" "finalizer"
           ,closureField C "StgAtomicallyFrame" "next_invariant_to_check"
           ,closureField C "StgAtomicallyFrame" "result"
 
@@ -491,6 +492,7 @@ wanteds os = concat
           ,closureField C "StgAtomicInvariant" "code"
 
           ,closureField C "StgTRecHeader" "enclosing_trec"
+          ,closureField C "StgTRecHeader" "state"
 
           ,closureSize  C "StgCatchSTMFrame"
           ,closureField C "StgCatchSTMFrame" "handler"
@@ -507,6 +509,7 @@ wanteds os = concat
 
           ,closureSize  C "StgTVar"
           ,closureField C "StgTVar" "current_value"
+          ,closureField C "StgTVar" "frozen_by"
           ,closureField C "StgTVar" "first_watch_queue_entry"
           ,closureField C "StgTVar" "num_updates"
 

@@ -68,6 +68,7 @@ module GHC.Conc.Sync
         -- * TVars
         , STM(..)
         , atomically
+        , atomicallyWithIO
         , retry
         , orElse
         , throwSTM
@@ -696,6 +697,32 @@ unsafeIOToSTM (IO m) = STM m
 
 atomically :: STM a -> IO a
 atomically (STM m) = IO (\s -> (atomically# m) s )
+
+-- |Perform a series of STM actions atomically, together with a finalizing IO
+-- action.
+--
+-- The finalizer, which is an arbitrary I/O action that can depend on the
+-- result of the STM computation, behaves as follows:
+--
+--   * The finalizer is only performed if the STM transaction is guaranteed
+--     to commit. This means the finalizer is only ever run once, if it is
+--     run at all.
+--
+--   * The STM transaction only commits if the finalizer finishes without
+--     raising an exception. This gives the finalizer a chance to abort
+--     the transaction.
+--
+-- The same caveat as with 'atomically' applies: you cannot use
+-- 'atomicallyWithIO' inside 'unsafePerformIO'.
+--
+-- However, it is perfectly fine to call 'atomically' or 'atomicallyWithIO'
+-- from within a finalizer, provided that you do not manipulate the same TVars
+-- across such nested transactions. Doing so could cause a deadlock and any
+-- attempt will result in a runtime error.
+
+atomicallyWithIO :: STM a -> (a -> IO b) -> IO b
+atomicallyWithIO (STM m) f = IO (\s -> (atomicallyWithIO# m f') s)
+  where f' a = unIO (f a)
 
 -- |Retry execution of the current memory transaction because it has seen
 -- values in TVars which mean that it should not continue (e.g. the TVars

@@ -431,6 +431,7 @@ RTS_FUN_DECL(stg_retryzh);
 RTS_FUN_DECL(stg_catchRetryzh);
 RTS_FUN_DECL(stg_catchSTMzh);
 RTS_FUN_DECL(stg_atomicallyzh);
+RTS_FUN_DECL(stg_atomicallyWithIOzh);
 RTS_FUN_DECL(stg_newTVarzh);
 RTS_FUN_DECL(stg_readTVarzh);
 RTS_FUN_DECL(stg_readTVarIOzh);

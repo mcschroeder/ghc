@@ -315,6 +315,7 @@ typedef struct StgTVarWatchQueue_ {
 typedef struct {
   StgHeader                  header;
   StgClosure                *volatile current_value;
+  StgTRecHeader             *volatile frozen_by;
   StgTVarWatchQueue         *volatile first_watch_queue_entry;
   StgInt                     volatile num_updates;
 } StgTVar;
@@ -349,9 +350,12 @@ typedef struct StgTRecChunk_ {
 typedef enum {
   TREC_ACTIVE,        /* Transaction in progress, outcome undecided */
   TREC_CONDEMNED,     /* Transaction in progress, inconsistent / out of date reads */
+  TREC_FINALIZING,    /* Transaction in progress, running finalizer */
   TREC_COMMITTED,     /* Transaction has committed, now updating tvars */
   TREC_ABORTED,       /* Transaction has aborted, now reverting tvars */
-  TREC_WAITING,       /* Transaction currently waiting */
+  TREC_WAITING,       /* Transaction currently waiting (retry) */
+  TREC_WAITING_FOR_FINALIZER
+                      /* Transaction is waiting for a finalizer to finish */
 } TRecState;
 
 typedef struct StgInvariantCheckQueue_ {
@@ -372,6 +376,7 @@ struct StgTRecHeader_ {
 typedef struct {
   StgHeader   header;
   StgClosure *code;
+  StgClosure *finalizer;
   StgTVarWatchQueue *next_invariant_to_check;
   StgClosure *result;
 } StgAtomicallyFrame;

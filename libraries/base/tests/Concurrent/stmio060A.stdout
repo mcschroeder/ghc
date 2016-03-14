@@ -1,0 +1,10 @@
+Starting
+x = 42
+Adding false invariant & throw exception in IO
+Caught: Exn in invariant
+Check that invariant wasn't added
+x = 100
+Adding true invariant & throw exception in IO
+Caught: Exn in attached IO
+Check that invariant wasn't added
+x = 42

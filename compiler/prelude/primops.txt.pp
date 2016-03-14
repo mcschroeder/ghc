@@ -2034,6 +2034,15 @@ primop  AtomicallyOp "atomically#" GenPrimOp
    out_of_line = True
    has_side_effects = True
 
+primop  AtomicallyWithIOOp "atomicallyWithIO#" GenPrimOp
+      (State# RealWorld -> (# State# RealWorld, a #) )
+   -> (a -> State# RealWorld -> (# State# RealWorld, b #) )
+   -> (State# RealWorld -> (# State# RealWorld, b #) )
+   with
+   strictness  = { \ _arity -> mkClosedStrictSig [strictApply1Dmd,lazyApply2Dmd,topDmd] topRes }
+   out_of_line = True
+   has_side_effects = True
+
 -- NB: retry#'s strictness information specifies it to return bottom.
 -- This lets the compiler perform some extra simplifications, since retry#
 -- will technically never return.

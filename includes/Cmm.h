@@ -782,6 +782,12 @@
 #define STM_AWOKEN                stg_STM_AWOKEN_closure
 #define END_INVARIANT_CHECK_QUEUE stg_END_INVARIANT_CHECK_QUEUE_closure
 
+/* These have to match TRecState from Closures.h */
+#define TRecIsFinalizing(t) (StgTRecHeader_state(t) == 2 :: CInt)
+#define TRecIsWaitingForFinalizer(t) (StgTRecHeader_state(t) == 6 :: CInt)
+
+#define TRecIsBoundary(t) ((t) == NO_TREC || TRecIsFinalizing(t))
+
 #define recordMutableCap(p, gen)                                        \
   W_ __bd;                                                              \
   W_ mut_list;                                                          \

@@ -1,0 +1,22 @@
+Starting
+TVar contains 42
+Raising uncaught exn in atomic block
+Caught: Exn raised in a tx
+TVar contains 42
+Trying a catchSTM without raising an exception
+IO
+TVar contains 17
+Raising caught and rethrown exn in atomic block
+Caught: Exn raised in a tx
+TVar contains 17
+Raising caught and rethrown exn in atomic block
+IO
+TVar contained 0 at end of atomic block
+TVar contains 0
+Testing retry inside catchSTM
+IO
+TVar contains 0
+Raising exn in attached I/O
+IO
+Caught: Exn raised in tx IO
+TVar contains 0

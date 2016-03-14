@@ -486,12 +486,13 @@ retry_pop_stack:
       ccall stmAbortTransaction(MyCapability() "ptr", trec "ptr");
       ccall stmFreeAbortedTRec(MyCapability() "ptr", trec "ptr");
 
-      if (outer != NO_TREC) {
+      if (!TRecIsBoundary(outer)) {
         ccall stmAbortTransaction(MyCapability() "ptr", outer "ptr");
         ccall stmFreeAbortedTRec(MyCapability() "ptr", outer "ptr");
+        outer = NO_TREC;
       }
 
-      StgTSO_trec(CurrentTSO) = NO_TREC;
+      StgTSO_trec(CurrentTSO) = outer;
       if (r != 0) {
         // Transaction was valid: continue searching for a catch frame
         Sp = Sp + SIZEOF_StgAtomicallyFrame;
@@ -499,7 +500,7 @@ retry_pop_stack:
       } else {
         // Transaction was not valid: we retry the exception (otherwise continue
         // with a further call to raiseExceptionHelper)
-        ("ptr" trec) = ccall stmStartTransaction(MyCapability() "ptr", NO_TREC "ptr");
+        ("ptr" trec) = ccall stmStartTransaction(MyCapability() "ptr", outer "ptr");
         StgTSO_trec(CurrentTSO) = trec;
         R1 = StgAtomicallyFrame_code(Sp);
         jump stg_ap_v_fast [R1];
@@ -607,6 +608,7 @@ retry_pop_stack:
       W_ trec, outer;
       trec = StgTSO_trec(CurrentTSO);
       outer  = StgTRecHeader_enclosing_trec(trec);
+      ASSERT(outer == NO_TREC || !TRecIsFinalizing(outer));
       ccall stmAbortTransaction(MyCapability() "ptr", trec "ptr");
       ccall stmFreeAbortedTRec(MyCapability() "ptr", trec "ptr");
       StgTSO_trec(CurrentTSO) = outer;

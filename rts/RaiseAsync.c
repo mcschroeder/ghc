@@ -997,7 +997,7 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
 
         case ATOMICALLY_FRAME:
             if (stop_at_atomically) {
-                ASSERT(tso->trec->enclosing_trec == NO_TREC);
+                ASSERT(TRecIsBoundary(tso->trec->enclosing_trec));
                 stmCondemnTransaction(cap, tso -> trec);
                 stack->sp = frame - 2;
                 // The ATOMICALLY_FRAME expects to be returned a

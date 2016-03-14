@@ -1,0 +1,55 @@
+-- atomically (atomically), illegal
+Caught: Control.Concurrent.STM.atomically was nested
+x == 0   OK
+-- atomically (atomicallyWithIO), illegal
+Caught: Control.Concurrent.STM.atomically was nested
+x == 0   OK
+-- atomicallyWithIO (atomically) (), illegal
+Caught: Control.Concurrent.STM.atomically was nested
+x == 0   OK
+-- atomicallyWithIO () (atomically)
+x == 1   OK
+-- atomicallyWithIO () (atomically error)
+Caught: rollback inner
+x == 0   OK
+-- atomicallyWithIO () (catch atomically error)
+Caught: rollback inner
+x == 1   OK
+-- atomicallyWithIO () (atomically retry)
+Caught: thread blocked indefinitely in an STM transaction
+x == 0   OK
+-- atomicallyWithIO () (atomically retry orElse)
+x == 1   OK
+-- atomicallyWithIO () (atomically; atomically)
+x == 1   OK
+y == 2   OK
+-- atomicallyWithIO () (atomically; atomically error)
+Caught: rollback 2nd inner
+x == 0   OK
+y == 1   OK
+-- atomicallyWithIO () (atomicallyWithIO () ())
+x == 1   OK
+y == 1   OK
+-- atomicallyWithIO () (atomicallyWithIO () (atomically error))
+Caught: rollback inner inner
+x == 0   OK
+y == 0   OK
+-- atomicallyWithIO (read x) (atomically read x)
+-- atomicallyWithIO (write x) (atomically read x)
+inner read: x == 0
+x == 1   OK
+-- atomicallyWithIO (write x) (readTVarIO x)
+inner read: x == 0
+x == 1   OK
+-- atomicallyWithIO (read x) (atomically write x), illegal
+Caught: thread blocked indefinitely in an STM transaction
+x == 0   OK
+-- atomicallyWithIO (write x) (atomically write x), illegal
+Caught: thread blocked indefinitely in an STM transaction
+x == 0   OK
+-- atomicallyWithIO (read x) (atomicallyWithIO () (atomically write x)), illegal
+Caught: thread blocked indefinitely in an STM transaction
+x == 0   OK
+-- atomicallyWithIO (write x) (atomicallyWithIO () (atomically write x)), illegal
+Caught: thread blocked indefinitely in an STM transaction
+x == 0   OK
