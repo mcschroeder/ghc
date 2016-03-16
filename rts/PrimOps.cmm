@@ -1008,9 +1008,11 @@ INFO_TABLE_RET(stg_catch_retry_frame, CATCH_RETRY_FRAME,
 // Atomically frame ------------------------------------------------------------
 
 // This must match StgAtomicallyFrame in Closures.h
-#define ATOMICALLY_FRAME_FIELDS(w_,p_,info_ptr,p1,p2,code,finalizer,next,result) \
+#define ATOMICALLY_FRAME_FIELDS(w_,p_,info_ptr,p1,p2,                            \
+                                exceptions_blocked,code,finalizer,next,result)   \
     w_ info_ptr,                                                                 \
     PROF_HDR_FIELDS(w_,p1,p2)                                                    \
+    w_ exceptions_blocked,                                                       \
     p_ code,                                                                     \
     p_ finalizer,                                                                \
     p_ next,                                                                     \
@@ -1021,6 +1023,7 @@ INFO_TABLE_RET(stg_atomically_frame, ATOMICALLY_FRAME,
                // layout of the frame, and bind the field names
                ATOMICALLY_FRAME_FIELDS(W_,P_,
                                        info_ptr, p1, p2,
+                                       exceptions_blocked,
                                        code,finalizer,
                                        next_invariant,
                                        frame_result))
@@ -1066,7 +1069,7 @@ INFO_TABLE_RET(stg_atomically_frame, ATOMICALLY_FRAME,
         q = StgInvariantCheckQueue_invariant(next_invariant);
         jump stg_ap_v_fast
             (ATOMICALLY_FRAME_FIELDS(,,info_ptr,p1,p2,
-                                     code,finalizer,
+                                     exceptions_blocked,code,finalizer,
                                      next_invariant,frame_result))
             (StgAtomicInvariant_code(q));
 
@@ -1079,9 +1082,30 @@ INFO_TABLE_RET(stg_atomically_frame, ATOMICALLY_FRAME,
         if (valid != 0) {
             /* Transaction was valid: we can commit */
             if (TRecIsFinalizing(trec)) {
+
+                /* Mask async exceptions during the finalizer, and restore them
+                 * once we return from it. This follows a similar construction
+                 * as the CATCH_FRAME branch in stg_raise from Exception.cmm
+                 */
+
+                if ((exceptions_blocked & TSO_BLOCKEX) == 0) {
+                    Sp_adj(-1);
+                    Sp(0) = stg_unmaskAsyncExceptionszh_ret_info;
+                }
+
+                StgTSO_flags(CurrentTSO) = %lobits32(
+                    TO_W_(StgTSO_flags(CurrentTSO)) |
+                    TSO_BLOCKEX | TSO_INTERRUPTIBLE);
+
+                if ((exceptions_blocked &
+                    (TSO_BLOCKEX | TSO_INTERRUPTIBLE)) == TSO_BLOCKEX) {
+                    StgTSO_flags(CurrentTSO) = %lobits32(
+                        TO_W_(StgTSO_flags(CurrentTSO)) & ~TSO_INTERRUPTIBLE);
+                }
+
                 jump stg_ap_pv_fast
                     (ATOMICALLY_FRAME_FIELDS(,,info_ptr,p1,p2,
-                                             code,finalizer,
+                                             exceptions_blocked,code,finalizer,
                                              next_invariant,frame_result))
                     (finalizer,frame_result);
             }
@@ -1098,7 +1122,7 @@ finishCommit:
             /* Transaction was valid, but some TVars are involved in a finalizer;
              * we have been put on the TVars' watch queues, so now we block */
             push (ATOMICALLY_FRAME_FIELDS(,,stg_atomically_waiting_frame_info,p1,p2,
-                                          code,finalizer,
+                                          exceptions_blocked,code,finalizer,
                                           next_invariant,frame_result))
             {
                 R3 = trec; // passing to stmWaitUnblock()
@@ -1115,7 +1139,7 @@ finishCommit:
                 // push the StgAtomicallyFrame again: the code generator is
                 // clever enough to only assign the fields that have changed.
                 (ATOMICALLY_FRAME_FIELDS(,,info_ptr,p1,p2,
-                                         code,finalizer,
+                                         exceptions_blocked,code,finalizer,
                                          next_invariant,frame_result))
                 (code);
         }
@@ -1127,6 +1151,7 @@ INFO_TABLE_RET(stg_atomically_waiting_frame, ATOMICALLY_FRAME,
                // layout of the frame, and bind the field names
                ATOMICALLY_FRAME_FIELDS(W_,P_,
                                        info_ptr, p1, p2,
+                                       exceptions_blocked,
                                        code,finalizer,
                                        next_invariant,
                                        frame_result))
@@ -1140,7 +1165,7 @@ INFO_TABLE_RET(stg_atomically_waiting_frame, ATOMICALLY_FRAME,
         /* Previous attempt is still valid: no point trying again yet */
         jump stg_block_noregs
             (ATOMICALLY_FRAME_FIELDS(,,info_ptr, p1, p2,
-                                     code,finalizer,
+                                     exceptions_blocked,code,finalizer,
                                      next_invariant,frame_result))
             ();
     } else {
@@ -1151,7 +1176,7 @@ INFO_TABLE_RET(stg_atomically_waiting_frame, ATOMICALLY_FRAME,
         // change the frame header to stg_atomically_frame_info
         jump stg_ap_v_fast
             (ATOMICALLY_FRAME_FIELDS(,,stg_atomically_frame_info, p1, p2,
-                                     code,finalizer,
+                                     exceptions_blocked,code,finalizer,
                                      next_invariant,frame_result))
             (code);
     }
@@ -1211,6 +1236,7 @@ stg_atomicallyWithIOzh (P_ stm        /* :: STM a */,
     P_ old_trec;
     P_ new_trec;
     P_ code, next_invariant, frame_result;
+    W_ exceptions_blocked;
 
     // stmStartTransaction may allocate
     MAYBE_GC_PP(stg_atomicallyWithIOzh, stm, finalizer);
@@ -1224,6 +1250,12 @@ stg_atomicallyWithIOzh (P_ stm        /* :: STM a */,
         jump stg_raisezh(base_ControlziExceptionziBase_nestedAtomically_closure);
     }
 
+    /* Remember if exceptions are currently unmasked, 
+     * so that we may unmask them again after the finalizer returns.
+     */
+    exceptions_blocked =
+        TO_W_(StgTSO_flags(CurrentTSO)) & (TSO_BLOCKEX | TSO_INTERRUPTIBLE);
+
     code = stm;
     next_invariant = END_INVARIANT_CHECK_QUEUE;
     frame_result = NO_TREC;
@@ -1234,7 +1266,8 @@ stg_atomicallyWithIOzh (P_ stm        /* :: STM a */,
 
     jump stg_ap_v_fast
         (ATOMICALLY_FRAME_FIELDS(,,stg_atomically_frame_info, CCCS, 0,
-                                 code,finalizer,next_invariant,frame_result))
+                                 exceptions_blocked,code,finalizer,
+                                 next_invariant,frame_result))
         (stm);
 }
 

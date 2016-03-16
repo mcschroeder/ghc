@@ -375,6 +375,7 @@ struct StgTRecHeader_ {
 
 typedef struct {
   StgHeader   header;
+  StgWord     exceptions_blocked;
   StgClosure *code;
   StgClosure *finalizer;
   StgTVarWatchQueue *next_invariant_to_check;

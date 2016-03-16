@@ -480,6 +480,7 @@ wanteds os = concat
           ,closureField C "StgMutVar" "var"
 
           ,closureSize  C "StgAtomicallyFrame"
+          ,closureField C "StgAtomicallyFrame" "exceptions_blocked"
           ,closureField C "StgAtomicallyFrame" "code"
           ,closureField C "StgAtomicallyFrame" "finalizer"
           ,closureField C "StgAtomicallyFrame" "next_invariant_to_check"
